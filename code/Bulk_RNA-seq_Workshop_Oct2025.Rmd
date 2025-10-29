@@ -1,0 +1,263 @@
+---
+title: "Bulk RNA-seq Analysis Workshop"
+date: "October 29, 2025"
+output: html_notebook
+---
+
+```{r}
+if (!requireNamespace(DESeq2, quietly = TRUE)) { # If not installed, install the package
+  install.packages(DESeq2, dependencies = TRUE)
+}
+
+if (!requireNamespace(tidyverse, quietly = TRUE)) { 
+  install.packages(tidyverse, dependencies = TRUE)
+}
+
+if (!requireNamespace(PCAtools, quietly = TRUE)) { 
+  install.packages(PCAtools, dependencies = TRUE)
+}
+
+if (!requireNamespace(fgsea, quietly = TRUE)) {
+  install.packages(fgsea, dependencies = TRUE)
+}
+
+if (!requireNamespace(msigdbr, quietly = TRUE)) {
+  install.packages(msigdbr, dependencies = TRUE)
+}
+
+if (!requireNamespace(EnhancedVolcano, quietly = TRUE)) {
+  install.packages(EnhancedVolcano, dependencies = TRUE)
+}
+
+if (!requireNamespace(pheatmap, quietly = TRUE)) {
+  install.packages(pheatmap, dependencies = TRUE)
+}
+
+if (!requireNamespace(decoupleR, quietly = TRUE)) {
+  install.packages(decoupleR, dependencies = TRUE)
+}
+
+if (!requireNamespace(ashr, quietly = TRUE)) {
+  install.packages(ashr, dependencies = TRUE)
+}
+```
+
+
+## load libraries
+```{r}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(tidyverse)
+  library(PCAtools)
+  library(fgsea)
+  library(msigdbr)
+  library(EnhancedVolcano)
+  library(pheatmap)
+  library(decoupleR)
+  library(ashr)
+})
+```
+
+
+
+## Create output directory
+```{r}
+dir.create("outputs", showWarnings = F, recursive = T)
+```
+
+
+## Load count data
+**NOTES: here we will store the gene symbols in a dataframe and keep the gene id as the rowname. This is because in the count matrix that we have, some genes ids have the same gene symbols so we will keep the gene id as rownames to avoid duplicates and add the gene symbols in the end for visualization.**
+```{r}
+ct_mtx <- read.table("gene_expected_count.annot.txt", quote = "", header = T, fill = T, sep = "\t")
+gene_symbols <- data.frame(gene_symbol = ct_mtx$external_gene_name) %>% `rownames<-`(ct_mtx$gene_id)
+ct_mtx <- ct_mtx %>%
+  select(-c("entrezgene_id", "external_gene_name", "description")) %>%
+  column_to_rownames('gene_id')
+```
+
+## Remove the X in the begining of each sample name and make them match the sample names in metadata file
+```{r}
+colnames(ct_mtx) <- gsub("^X", "", colnames(ct_mtx))
+colnames(ct_mtx) <- gsub("\\.", "-", colnames(ct_mtx))
+```
+
+## loading metadata
+```{r}
+metadata <- read.csv("metadata.csv", header = T) %>%
+  column_to_rownames('sample')
+metadata <- metadata[colnames(ct_mtx),]
+## converting the batch info to factor because it is categorical data not numerical
+metadata$Batch <- as.factor(metadata$Batch)
+```
+
+# DESeq object all samples
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = ct_mtx,
+                              colData = metadata,
+                              rowData = gene_symbols,
+                              design = ~ 1)
+```
+
+
+# PCA analysis
+```{r fig.width=10, fig.height=7}
+vst <- assay(vst(dds))
+rv <- rowVars(vst)
+select <- order(rv, decreasing=TRUE)[seq_len(min(2000, length(dds)))]
+pca <- pca(vst[select,], metadata = colData(dds))
+color_by <- 'IL33.Status'
+shape_by <- 'Cell.Line'
+biplot(pca,
+       showLoadings = F,
+       colby = color_by,
+       shape = shape_by,
+       labSize = 2, pointSize = 5, drawConnectors = T,
+       legendPosition = 'right',
+       legendLabSize = 7, legendIconSize = 4, legendTitleSize = 10)
+```
+
+# Correlation heatmap
+```{r}
+ann <- data.frame(KO_status = metadata$IL33.Status,
+                  CellLine = metadata$Cell.Line, 
+                  row.names = rownames(metadata))
+pheatmap(cor(vst), annotation_col = ann, annotation_row = ann)
+```
+
+# Differential Gene Expression (DGE) Analysis
+## 1) Setting WT as a reference, and comparing everything to it
+```{r}
+dds$IL33.Status <- factor(dds$IL33.Status, levels = c('WT', 'KO'))
+design(dds) <- model.matrix(~ IL33.Status + Batch + Treatment, data = colData(dds))
+dds <- DESeq(dds, quiet = T)
+```
+
+### We can check the coefficients for different contrasts using `resultsNames(dds)`
+```{r}
+resultsNames(dds)
+```
+
+We can see that we can check the effect of being KO using the coefficient IL33.StatusKO
+```{r}
+KO_v_wt <- lfcShrink(dds, coef = 'IL33.StatusKO', type = 'ashr', quiet = T) %>%
+  data.frame() %>%
+  merge(gene_symbols, by = 0) %>%
+  filter(!is.na(padj)) %>%
+  rename(gene_id = Row.names)
+```
+
+## 2) Removing the intercept and setting up contrasts to compare different groups.
+This is particularly beneficial when you have more than one level in the variable (e.g., WT, KO, DKO) and you want to have pairwise comparisons.
+```{r}
+design(dds) <- model.matrix(~ 0 + IL33.Status + Batch + Treatment, data = colData(dds))
+dds <- DESeq(dds, quiet = T)
+```
+
+### We can check the coefficients for different contrasts using `resultsNames(dds)`
+```{r}
+resultsNames(dds)
+```
+
+We first have to specify the contrast.
+```{r}
+KO_v_wt <- lfcShrink(dds, contrast = list('IL33.StatusKO','IL33.StatusWT'), type = 'ashr', quiet = T) %>%
+  data.frame() %>%
+  merge(gene_symbols, by = 0) %>%
+  filter(!is.na(padj)) %>%
+  rename(gene_id = Row.names) 
+```
+
+Both approaches should have very similar results. We will save the results as a csv file
+```{r}
+write.csv(KO_v_wt, "outputs/mouse_il33_v_wt_dge.csv", row.names = F)
+head(KO_v_wt[,-1])
+```
+
+## Volcano Plot
+```{r fig.height=8, fig.width=5}
+EnhancedVolcano(KO_v_wt,
+                lab = KO_v_wt$gene_symbol,
+                x = 'log2FoldChange',
+                y = 'padj',
+                title = 'IL33 KO vs WT',
+                subtitle = NULL,
+                pCutoff = 0.05,
+                FCcutoff = 1,
+                pointSize = 1,
+                xlim = c(-5, 5),
+                ylim = c(0, 20),
+                legendLabels = c('NS', 'FDR < 0.05', 'log2FC > 1', 'FDR < 0.05 & log2FC > 1'),
+                legendPosition = 'top',
+                legendLabSize = 12,
+                legendIconSize = 5,
+                labSize = 2)
+```
+## Plot counts of individual genes
+```{r}
+gene <- 'Igfbp5'
+gene_id <- gene_symbols %>% filter(gene_symbol == gene) %>% rownames()
+group <- 'IL33.Status'
+plot_df <- plotCounts(dds, gene = gene_id, intgroup = group, returnData = T)
+ggplot(plot_df, aes_string(x = group, y = 'count', fill = group)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.1) +
+  labs(title = gene)
+```
+
+
+# Gene Set Enrichment Analysis (GSEA)
+```{r}
+species <- 'Mus musculus'
+hallmarks_pathways <- msigdbr(species = species, category = 'H', subcategory = NULL)
+hallmarks_pathways <- split(x = hallmarks_pathways$ensembl_gene, f = hallmarks_pathways$gs_name)
+
+gene_rank <- KO_v_wt %>%
+  pull(log2FoldChange) %>%
+  `names<-`(KO_v_wt$gene_id) %>%
+  sort()
+
+gsea_res <- fgsea(pathways = hallmarks_pathways,
+                  stats = gene_rank)
+```
+
+**We will save the results as a csv file**
+```{r}
+write.csv(gsea_res[,-8], "outputs/mouse_il33_v_wt_gsea.csv", row.names = F)
+```
+
+### GSEA results
+```{r}
+topPathwaysUp <- gsea_res[NES > 0][head(order(padj), n=5), pathway]
+topPathwaysDown <- gsea_res[NES < 0][head(order(padj), n=5), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+plotGseaTable(hallmarks_pathways[topPathways],
+              gene_rank,
+              gsea_res,
+              gseaParam=0.5)
+```
+### Show enrichment plot for a single pathway
+```{r}
+plotEnrichment(hallmarks_pathways$HALLMARK_MYC_TARGETS_V1,
+               gene_rank,
+               gseaParam=0.5)
+```
+
+#### Leading Edge
+```{r}
+gsea_gene_list <- gsea_res$leadingEdge[1]
+gsea_gene_list <- unlist(gsea_gene_list)
+
+counts <- ct_mtx %>% 
+  mutate(gene_symbol = gene_symbols$gene_symbol) 
+
+object1 <- counts %>%
+  filter(rownames(counts) %in% gsea_gene_list)
+
+rownames(object1) <- object1$gene_symbol
+object2 <- object1[,1:16]
+
+scaled_expression <- t(scale(t(object2)))
+
+pheatmap(scaled_expression, cluster_col = FALSE, cluster_rows = TRUE)
+```
