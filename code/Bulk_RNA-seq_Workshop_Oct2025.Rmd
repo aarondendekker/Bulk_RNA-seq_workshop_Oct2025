@@ -3,7 +3,7 @@ title: "Bulk RNA-seq Analysis Workshop"
 date: "October 29, 2025"
 output: html_notebook
 ---
-
+# Install packages if not available
 ```{r}
 if (!requireNamespace(DESeq2, quietly = TRUE)) { # If not installed, install the package
   install.packages(DESeq2, dependencies = TRUE)
